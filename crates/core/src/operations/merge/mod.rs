@@ -41,11 +41,13 @@ use datafusion::common::{Column, DFSchema, ExprSchema, ScalarValue, TableReferen
 use datafusion::datasource::provider_as_source;
 use datafusion::error::Result as DataFusionResult;
 use datafusion::execution::session_state::SessionStateBuilder;
+use datafusion::functions_aggregate::count::count_all;
+use datafusion::functions_window::expr_fn::row_number;
 use datafusion::logical_expr::build_join_schema;
 use datafusion::logical_expr::execution_props::ExecutionProps;
 use datafusion::logical_expr::simplify::SimplifyContext;
 use datafusion::logical_expr::{
-    Expr, JoinType, col, conditional_expressions::CaseBuilder, lit, when,
+    Expr, ExprFunctionExt, JoinType, col, conditional_expressions::CaseBuilder, lit, when,
 };
 use datafusion::logical_expr::{
     Extension, LogicalPlan, LogicalPlanBuilder, UNNAMED_TABLE, UserDefinedLogicalNode,
@@ -104,6 +106,8 @@ const TARGET_COLUMN: &str = "__delta_rs_target";
 
 const OPERATION_COLUMN: &str = "__delta_rs_operation";
 const DELETE_COLUMN: &str = "__delta_rs_delete";
+const TARGET_ROW_INDEX_COLUMN: &str = "__delta_rs_target_row_index";
+const TARGET_MATCH_COUNT_COLUMN: &str = "__delta_rs_target_match_count";
 pub(crate) const TARGET_INSERT_COLUMN: &str = "__delta_rs_target_insert";
 pub(crate) const TARGET_UPDATE_COLUMN: &str = "__delta_rs_target_update";
 pub(crate) const TARGET_DELETE_COLUMN: &str = "__delta_rs_target_delete";
@@ -943,6 +947,14 @@ async fn execute(
         }),
     });
     let target = DataFrame::new(state.clone(), target);
+    let target_order_by = target
+        .schema()
+        .columns()
+        .iter()
+        .map(|column| Expr::Column(column.clone()).sort(true, true))
+        .collect();
+    let row_number_expr = row_number().order_by(target_order_by).build()?;
+    let target = target.window(vec![row_number_expr.alias(TARGET_ROW_INDEX_COLUMN)])?;
     let target = target.with_column(TARGET_COLUMN, lit(true))?;
 
     let join = source.join(target, JoinType::Full, &[], &[], Some(predicate.clone()))?;
@@ -1075,6 +1087,8 @@ async fn execute(
         }
         Ok(predicates)
     }
+
+    let has_match_actions = !match_operations.is_empty();
 
     let match_operations = update_case(
         match_operations,
@@ -1317,6 +1331,31 @@ async fn execute(
 
         LogicalPlanBuilder::from(plan).project(fields)?.build()?
     };
+
+    if has_match_actions {
+        let duplicate_matches = DataFrame::new(state.clone(), new_columns.clone())
+            .filter(
+                col(TARGET_ROW_INDEX_COLUMN).is_not_null().and(
+                    col(TARGET_UPDATE_COLUMN)
+                        .is_null()
+                        .or(col(TARGET_DELETE_COLUMN).is_null()),
+                ),
+            )?
+            .aggregate(
+                vec![col(TARGET_ROW_INDEX_COLUMN)],
+                vec![count_all().alias(TARGET_MATCH_COUNT_COLUMN)],
+            )?
+            .filter(col(TARGET_MATCH_COUNT_COLUMN).gt(lit(1_i64)))?
+            .limit(0, Some(1))?
+            .collect()
+            .await?;
+
+        if duplicate_matches.iter().any(|batch| batch.num_rows() > 0) {
+            return Err(DeltaTableError::Generic(
+                "Merge matched a single target row with multiple source rows".to_string(),
+            ));
+        }
+    }
 
     let distribute_expr = col(file_column.as_str());
 
