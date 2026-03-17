@@ -6,10 +6,9 @@ use std::task::{Context, Poll};
 use arrow::array::{Array, RecordBatch, UInt64Array};
 use arrow::datatypes::SchemaRef;
 use datafusion::common::{DataFusionError, Result as DataFusionResult};
-use datafusion::logical_expr::{LogicalPlan, UserDefinedLogicalNodeCore};
-use datafusion::physical_plan::{
-    DisplayAs, DisplayFormatType, ExecutionPlan, RecordBatchStream, SendableRecordBatchStream,
-};
+use datafusion::logical_expr::{Expr, LogicalPlan, UserDefinedLogicalNodeCore};
+use datafusion::physical_expr::Distribution;
+use datafusion::physical_plan::{DisplayAs, DisplayFormatType, ExecutionPlan, PhysicalExpr, RecordBatchStream, SendableRecordBatchStream};
 use futures::{Stream, StreamExt};
 
 use crate::operations::merge::{TARGET_ROW_INDEX_COLUMN, TARGET_UPDATE_COLUMN};
@@ -18,11 +17,15 @@ use crate::DeltaTableError;
 #[derive(Debug)]
 pub(crate) struct MergeValidationExec {
     input: Arc<dyn ExecutionPlan>,
+    row_index_expr: Arc<dyn PhysicalExpr>,
 }
 
 impl MergeValidationExec {
-    pub fn new(input: Arc<dyn ExecutionPlan>) -> Self {
-        Self { input }
+    pub fn new(input: Arc<dyn ExecutionPlan>, expr: Arc<dyn PhysicalExpr>) -> Self {
+        Self {
+            input,
+            row_index_expr: expr
+        }
     }
 }
 
@@ -43,6 +46,10 @@ impl ExecutionPlan for MergeValidationExec {
         self.input.properties()
     }
 
+    fn required_input_distribution(&self) -> Vec<Distribution> {
+        vec![Distribution::HashPartitioned(vec![self.row_index_expr.clone()]); 1]
+    }
+
     fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> {
         vec![&self.input]
     }
@@ -56,7 +63,10 @@ impl ExecutionPlan for MergeValidationExec {
                 "MergeValidationExec wrong number of children".to_string(),
             ));
         }
-        Ok(Arc::new(Self::new(children[0].clone())))
+        Ok(Arc::new(Self::new(
+            children[0].clone(),
+            self.row_index_expr.clone(),
+        )))
     }
 
     fn execute(
@@ -169,6 +179,7 @@ impl RecordBatchStream for MergeValidationStream {
 #[derive(Debug, Hash, Eq, PartialEq, PartialOrd)]
 pub(crate) struct MergeValidation {
     pub input: LogicalPlan,
+    pub expr: Expr
 }
 
 impl UserDefinedLogicalNodeCore for MergeValidation {
@@ -184,8 +195,8 @@ impl UserDefinedLogicalNodeCore for MergeValidation {
         self.input.schema()
     }
 
-    fn expressions(&self) -> Vec<datafusion::logical_expr::Expr> {
-        vec![]
+    fn expressions(&self) -> Vec<Expr> {
+        vec![self.expr.clone()]
     }
 
     fn fmt_for_explain(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
@@ -194,11 +205,12 @@ impl UserDefinedLogicalNodeCore for MergeValidation {
 
     fn with_exprs_and_inputs(
         &self,
-        _exprs: Vec<datafusion::logical_expr::Expr>,
+        exprs: Vec<datafusion::logical_expr::Expr>,
         inputs: Vec<LogicalPlan>,
     ) -> DataFusionResult<Self> {
         Ok(Self {
             input: inputs[0].clone(),
+            expr: exprs[0].clone(),
         })
     }
 }

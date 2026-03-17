@@ -739,6 +739,18 @@ impl ExtensionPlanner for MergeMetricExtensionPlanner {
             }
         }
 
+        if let Some(validation) =  node.as_any().downcast_ref::<MergeValidation>() {
+            if physical_inputs.len() != 1 {
+                return plan_err!("MergeValidationExec expects exactly one input");
+            }
+
+            let schema = validation.input.schema();
+            return Ok(Some(Arc::new(MergeValidationExec::new(
+                physical_inputs.first().unwrap().clone(),
+                planner.create_physical_expr(&validation.expr, schema, session_state)?
+            ))));
+        }
+
         if let Some(barrier) = node.as_any().downcast_ref::<MergeBarrier>() {
             if physical_inputs.len() != 1 {
                 return plan_err!("MergeBarrierExec expects exactly one input");
@@ -748,15 +760,6 @@ impl ExtensionPlanner for MergeMetricExtensionPlanner {
                 physical_inputs.first().unwrap().clone(),
                 barrier.file_column.clone(),
                 planner.create_physical_expr(&barrier.expr, schema, session_state)?,
-            ))));
-        }
-
-        if node.as_any().downcast_ref::<MergeValidation>().is_some() {
-            if physical_inputs.len() != 1 {
-                return plan_err!("MergeValidationExec expects exactly one input");
-            }
-            return Ok(Some(Arc::new(MergeValidationExec::new(
-                physical_inputs.first().unwrap().clone(),
             ))));
         }
 
@@ -1334,7 +1337,10 @@ async fn execute(
 
     let new_columns = if !match_operations.is_empty() {
         LogicalPlan::Extension(Extension {
-            node: Arc::new(MergeValidation { input: new_columns }),
+            node: Arc::new(MergeValidation {
+                input: new_columns,
+                expr: col(TARGET_ROW_INDEX_COLUMN)
+            }),
         })
     } else {
         new_columns
