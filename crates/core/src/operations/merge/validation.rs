@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::HashSet;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{Context, Poll};
@@ -87,7 +87,7 @@ impl DisplayAs for MergeValidationExec {
 struct MergeValidationStream {
     schema: SchemaRef,
     input: SendableRecordBatchStream,
-    target_match_counts: HashMap<u64, usize>,
+    target_matches: HashSet<u64>,
 }
 
 impl MergeValidationStream {
@@ -95,7 +95,7 @@ impl MergeValidationStream {
         Self {
             schema,
             input,
-            target_match_counts: HashMap::new(),
+            target_matches: HashSet::new(),
         }
     }
 
@@ -120,22 +120,17 @@ impl MergeValidationStream {
             })?;
 
         for row in 0..batch.num_rows() {
-            // Only matched records can have a non-null row index.
-            // A null update/delete marker identifies rows that apply an update/delete operation.
-            if target_row_index.is_null(row)
-                || !(target_update.is_null(row) || target_delete.is_null(row))
+            if !target_row_index.is_null(row)
+                && (target_update.is_null(row) || target_delete.is_null(row))
             {
-                continue;
-            }
+                let row_idx = target_row_index.value(row);
+                let is_duplicate = !self.target_matches.insert(row_idx);
 
-            let row_idx = target_row_index.value(row);
-            let count = self.target_match_counts.entry(row_idx).or_default();
-            *count += 1;
-
-            if *count > 1 {
-                return Err(DataFusionError::External(Box::new(DeltaTableError::Generic(
-                    "Merge matched a single target row with multiple source rows".to_string(),
-                ))));
+                if is_duplicate {
+                    return Err(DataFusionError::External(Box::new(DeltaTableError::Generic(
+                        "Merge matched a single target row with multiple source rows".to_string(),
+                    ))));
+                }
             }
         }
 
@@ -211,6 +206,99 @@ impl UserDefinedLogicalNodeCore for MergeValidation {
         Ok(Self {
             input: inputs[0].clone(),
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::MergeValidationStream;
+    use crate::operations::merge::{
+        TARGET_DELETE_COLUMN, TARGET_ROW_INDEX_COLUMN, TARGET_UPDATE_COLUMN,
+    };
+    use arrow::array::{BooleanArray, RecordBatch, UInt64Array};
+    use arrow::datatypes::{DataType, Field, Schema};
+    use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
+    use futures::stream;
+    use std::sync::Arc;
+
+    fn validation_schema() -> Arc<Schema> {
+        Arc::new(Schema::new(vec![
+            Field::new(TARGET_ROW_INDEX_COLUMN, DataType::UInt64, true),
+            Field::new(TARGET_UPDATE_COLUMN, DataType::Boolean, true),
+            Field::new(TARGET_DELETE_COLUMN, DataType::Boolean, true),
+        ]))
+    }
+
+    fn validation_stream() -> MergeValidationStream {
+        let schema = validation_schema();
+        let input = Box::pin(RecordBatchStreamAdapter::new(
+            schema.clone(),
+            stream::empty::<datafusion::common::Result<RecordBatch>>(),
+        ));
+
+        MergeValidationStream::new(input, schema)
+    }
+
+    fn matched_batch(update_indices: Vec<u64>, delete_indices: Vec<u64>) -> RecordBatch {
+        let schema = validation_schema();
+        let updates: Vec<Option<bool>> = vec![None; update_indices.len()]
+            .into_iter()
+            .chain(vec![Some(false); delete_indices.len()].into_iter())
+            .collect();;
+        let deletes: Vec<Option<bool>> = vec![Some(false); update_indices.len()]
+            .into_iter()
+            .chain(vec![None; delete_indices.len()].into_iter())
+            .collect();
+
+        let all_indices: Vec<Option<u64>> = update_indices
+            .into_iter()
+            .chain(delete_indices.into_iter())
+            .map(Some)
+            .collect();
+
+        RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(UInt64Array::from(all_indices)),
+                Arc::new(BooleanArray::from(updates)),
+                Arc::new(BooleanArray::from(deletes)),
+            ],
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn test_validation_distinct() {
+        let mut validation = validation_stream();
+        let first_batch = matched_batch(vec![1, 2], vec![3, 4]);
+        let second_batch = matched_batch(vec![5, 6], vec![7, 8]);
+
+        validation.validate_batch(&first_batch).unwrap();
+        validation.validate_batch(&second_batch).unwrap();
+    }
+
+    #[test]
+    fn test_validation_duplicate_updates() {
+        let mut validation = validation_stream();
+        let first_batch = matched_batch(vec![1, 2], vec![4]);
+        let second_batch = matched_batch(vec![2, 3], vec![5]);
+
+        validation.validate_batch(&first_batch).unwrap();
+        let _err = validation
+            .validate_batch(&second_batch)
+            .expect_err("expected duplicate target row to fail validation");
+    }
+
+    #[test]
+    fn test_validation_duplicate_deletes() {
+        let mut validation = validation_stream();
+        let first_batch = matched_batch(vec![4], vec![1, 2]);
+        let second_batch = matched_batch(vec![5], vec![2, 3]);
+
+        validation.validate_batch(&first_batch).unwrap();
+        let _err = validation
+            .validate_batch(&second_batch)
+            .expect_err("expected duplicate target row to fail validation");
     }
 }
 

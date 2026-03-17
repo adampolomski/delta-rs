@@ -224,7 +224,7 @@ def test_merge_when_matched_update_wo_predicate(
 
 @pytest.mark.parametrize("streaming", (True, False))
 @pytest.mark.parametrize("use_update_all", (False, True))
-def test_merge_when_matched_update_errors_on_multiple_source_matches(
+def test_merge_when_matched_update_duplicates(
     tmp_path: pathlib.Path,
     sample_table: Table,
     streaming: bool,
@@ -267,7 +267,7 @@ def test_merge_when_matched_update_errors_on_multiple_source_matches(
         merger = merger.when_matched_update_all(predicate="s.deleted = true")
     else:
         merger = merger.when_matched_update(
-            {"price": "s.price", "sold": "s.sold", "deleted": "s.deleted"},
+            {"price": "s.price"},
             predicate="s.deleted = true",
         )
 
