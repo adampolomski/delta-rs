@@ -947,14 +947,7 @@ async fn execute(
         }),
     });
     let target = DataFrame::new(state.clone(), target);
-    let target_order_by = target
-        .schema()
-        .columns()
-        .iter()
-        .map(|column| Expr::Column(column.clone()).sort(true, true))
-        .collect();
-    let row_number_expr = row_number().order_by(target_order_by).build()?;
-    let target = target.window(vec![row_number_expr.alias(TARGET_ROW_INDEX_COLUMN)])?;
+    let target = target.with_column(TARGET_ROW_INDEX_COLUMN, row_number())?;
     let target = target.with_column(TARGET_COLUMN, lit(true))?;
 
     let join = source.join(target, JoinType::Full, &[], &[], Some(predicate.clone()))?;
@@ -1087,8 +1080,6 @@ async fn execute(
         }
         Ok(predicates)
     }
-
-    let has_match_actions = !match_operations.is_empty();
 
     let match_operations = update_case(
         match_operations,
@@ -1332,7 +1323,7 @@ async fn execute(
         LogicalPlanBuilder::from(plan).project(fields)?.build()?
     };
 
-    if has_match_actions {
+    if !match_operations.is_empty() {
         let duplicate_matches = DataFrame::new(state.clone(), new_columns.clone())
             .filter(
                 col(TARGET_ROW_INDEX_COLUMN).is_not_null().and(
