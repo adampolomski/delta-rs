@@ -41,13 +41,12 @@ use datafusion::common::{Column, DFSchema, ExprSchema, ScalarValue, TableReferen
 use datafusion::datasource::provider_as_source;
 use datafusion::error::Result as DataFusionResult;
 use datafusion::execution::session_state::SessionStateBuilder;
-use datafusion::functions_aggregate::count::count_all;
 use datafusion::functions_window::expr_fn::row_number;
 use datafusion::logical_expr::build_join_schema;
 use datafusion::logical_expr::execution_props::ExecutionProps;
 use datafusion::logical_expr::simplify::SimplifyContext;
 use datafusion::logical_expr::{
-    Expr, ExprFunctionExt, JoinType, col, conditional_expressions::CaseBuilder, lit, when,
+    Expr, JoinType, col, conditional_expressions::CaseBuilder, lit, when,
 };
 use datafusion::logical_expr::{
     Extension, LogicalPlan, LogicalPlanBuilder, UNNAMED_TABLE, UserDefinedLogicalNode,
@@ -71,6 +70,7 @@ use tracing::*;
 use uuid::Uuid;
 
 use self::barrier::{MergeBarrier, MergeBarrierExec};
+use self::validation::{MergeValidation, MergeValidationExec};
 use super::{CustomExecuteHandler, Operation};
 use crate::delta_datafusion::expr::fmt_expr_to_sql;
 use crate::delta_datafusion::logical::MetricObserver;
@@ -100,6 +100,7 @@ use crate::{DeltaResult, DeltaTable, DeltaTableError};
 
 mod barrier;
 mod filter;
+mod validation;
 
 const SOURCE_COLUMN: &str = "__delta_rs_source";
 const TARGET_COLUMN: &str = "__delta_rs_target";
@@ -107,7 +108,6 @@ const TARGET_COLUMN: &str = "__delta_rs_target";
 const OPERATION_COLUMN: &str = "__delta_rs_operation";
 const DELETE_COLUMN: &str = "__delta_rs_delete";
 const TARGET_ROW_INDEX_COLUMN: &str = "__delta_rs_target_row_index";
-const TARGET_MATCH_COUNT_COLUMN: &str = "__delta_rs_target_match_count";
 pub(crate) const TARGET_INSERT_COLUMN: &str = "__delta_rs_target_insert";
 pub(crate) const TARGET_UPDATE_COLUMN: &str = "__delta_rs_target_update";
 pub(crate) const TARGET_DELETE_COLUMN: &str = "__delta_rs_target_delete";
@@ -751,6 +751,15 @@ impl ExtensionPlanner for MergeMetricExtensionPlanner {
             ))));
         }
 
+        if node.as_any().downcast_ref::<MergeValidation>().is_some() {
+            if physical_inputs.len() != 1 {
+                return plan_err!("MergeValidationExec expects exactly one input");
+            }
+            return Ok(Some(Arc::new(MergeValidationExec::new(
+                physical_inputs.first().unwrap().clone(),
+            ))));
+        }
+
         Ok(None)
     }
 }
@@ -1323,30 +1332,13 @@ async fn execute(
         LogicalPlanBuilder::from(plan).project(fields)?.build()?
     };
 
-    if !match_operations.is_empty() {
-        let duplicate_matches = DataFrame::new(state.clone(), new_columns.clone())
-            .filter(
-                col(TARGET_ROW_INDEX_COLUMN).is_not_null().and(
-                    col(TARGET_UPDATE_COLUMN)
-                        .is_null()
-                        .or(col(TARGET_DELETE_COLUMN).is_null()),
-                ),
-            )?
-            .aggregate(
-                vec![col(TARGET_ROW_INDEX_COLUMN)],
-                vec![count_all().alias(TARGET_MATCH_COUNT_COLUMN)],
-            )?
-            .filter(col(TARGET_MATCH_COUNT_COLUMN).gt(lit(1_i64)))?
-            .limit(0, Some(1))?
-            .collect()
-            .await?;
-
-        if duplicate_matches.iter().any(|batch| batch.num_rows() > 0) {
-            return Err(DeltaTableError::Generic(
-                "Merge matched a single target row with multiple source rows".to_string(),
-            ));
-        }
-    }
+    let new_columns = if !match_operations.is_empty() {
+        LogicalPlan::Extension(Extension {
+            node: Arc::new(MergeValidation { input: new_columns }),
+        })
+    } else {
+        new_columns
+    };
 
     let distribute_expr = col(file_column.as_str());
 
