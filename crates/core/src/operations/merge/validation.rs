@@ -250,6 +250,99 @@ impl UserDefinedLogicalNodeCore for MergeValidation {
 
 #[cfg(test)]
 mod tests {
-    // Window-based validation is constructed during merge plan building via datafusion expressions,
-    // not during execution. Tests have been moved to mod.rs where the logical plan is constructed.
+    use super::*;
+    use arrow::array::{Int32Array, RecordBatch, UInt64Array};
+    use arrow::datatypes::{DataType, Field, Schema};
+    use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
+
+    fn batch(target_indices: Vec<u64>, classes: Vec<i32>) -> RecordBatch {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new(TARGET_ROW_INDEX_COLUMN, DataType::UInt64, false),
+            Field::new(
+                TARGET_MATCH_CARDINALITY_CLASS_COLUMN,
+                DataType::Int32,
+                false,
+            ),
+        ]));
+
+        RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(UInt64Array::from(target_indices)),
+                Arc::new(Int32Array::from(classes)),
+            ],
+        )
+        .expect("failed to build test batch")
+    }
+
+    fn empty_stream(schema: SchemaRef) -> SendableRecordBatchStream {
+        let stream = futures::stream::iter(Vec::<DataFusionResult<RecordBatch>>::new());
+        Box::pin(RecordBatchStreamAdapter::new(schema, Box::pin(stream)))
+    }
+
+    fn validate(b: &RecordBatch) -> DataFusionResult<()> {
+        let mut s = MergeValidationStream::new(empty_stream(b.schema()), b.schema());
+        s.validate_batch(b)
+    }
+
+    #[test]
+    fn test_duplicate_fails() {
+        let b = batch(
+            vec![10, 10],
+            vec![
+                CardinalityClass::DuplicateInvalidating as i32,
+                CardinalityClass::DuplicateInvalidating as i32,
+            ],
+        );
+
+        let err = validate(&b).expect_err("expected duplicate violation");
+        assert!(
+            err.to_string()
+                .contains("Merge matched a single target row (index: 10)")
+        );
+    }
+
+    #[test]
+    fn test_no_duplicate_passes() {
+        let b = batch(
+            vec![10, 11],
+            vec![
+                CardinalityClass::DuplicateInvalidating as i32,
+                CardinalityClass::DuplicateInvalidating as i32,
+            ],
+        );
+
+        validate(&b).expect("should not fail for non-duplicate matches");
+    }
+
+    #[test]
+    fn test_unconditional_duplicate_deletes_passes() {
+        let b = batch(
+            vec![30, 30],
+            vec![
+                CardinalityClass::MatchedUnconditionalDelete as i32,
+                CardinalityClass::MatchedUnconditionalDelete as i32,
+            ],
+        );
+
+        validate(&b).expect("unconditional duplicate deletes should be allowed");
+    }
+
+    #[test]
+    fn test_unconditional_and_conditional_duplicate_deletes_fails() {
+        let b = batch(
+            vec![40, 40],
+            vec![
+                CardinalityClass::MatchedUnconditionalDelete as i32,
+                CardinalityClass::DuplicateInvalidating as i32,
+            ],
+        );
+
+        let err = validate(&b).expect_err("expected duplicate violation");
+        assert!(
+            err.to_string().contains(
+                "Merge matched a single target row (index: 40) with multiple source rows"
+            )
+        );
+    }
 }
