@@ -543,35 +543,25 @@ enum OperationType {
     Copy,
 }
 
-// Tracks the category and unconditional status for matched operations
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum MatchCategory {
-    Matched,
-    NotMatchedTarget,
-    NotMatchedSource,
-}
-
 /// Duplicate-match validation class encoding.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(i32)]
 enum CardinalityClass {
-    Ignore,
-    MatchedUnconditionalDelete,
-    DuplicateInvalidating,
+    Ignore = 0,
+    MatchedUnconditionalDelete = 1,
+    DuplicateInvalidating = 2,
 }
 
 impl CardinalityClass {
-    fn as_i32(self) -> i32 {
-        match self {
-            Self::Ignore => 0,
-            Self::MatchedUnconditionalDelete => 1,
-            Self::DuplicateInvalidating => 2,
+    fn for_matched_operation(op_type: OperationType, is_unconditional: bool) -> Self {
+        match op_type {
+            OperationType::Delete if is_unconditional => Self::MatchedUnconditionalDelete,
+            OperationType::Delete | OperationType::Update | OperationType::Copy => {
+                Self::DuplicateInvalidating
+            }
+            OperationType::Insert | OperationType::SourceDelete => Self::Ignore,
         }
     }
-}
-
-#[derive(Debug, Clone, Copy)]
-struct PlannedOp {
-    cardinality_class: CardinalityClass,
 }
 
 //Encapsute the User's Merge configuration for later processing
@@ -589,6 +579,8 @@ struct MergeOperation {
     /// How to update columns in a record that match the predicate
     operations: HashMap<Column, Expr>,
     r#type: OperationType,
+    /// Duplicate-match validation class for this operation.
+    cardinality_class: CardinalityClass,
 }
 
 impl MergeOperation {
@@ -648,7 +640,16 @@ impl MergeOperation {
             predicate: maybe_into_expr(config.predicate, schema, state)?,
             operations: ops,
             r#type: config.r#type,
+            cardinality_class: CardinalityClass::Ignore,
         })
+    }
+
+    fn into_matched(mut self) -> Self {
+        let is_unconditional =
+            matches!(self.r#type, OperationType::Delete) && self.predicate.is_none();
+        self.cardinality_class =
+            CardinalityClass::for_matched_operation(self.r#type, is_unconditional);
+        self
     }
 }
 
@@ -782,7 +783,7 @@ impl ExtensionPlanner for MergeMetricExtensionPlanner {
             }
         }
 
-        if let Some(validation) =  node.as_any().downcast_ref::<MergeValidation>() {
+        if let Some(validation) = node.as_any().downcast_ref::<MergeValidation>() {
             if physical_inputs.len() != 1 {
                 return plan_err!("MergeValidationExec expects exactly one input");
             }
@@ -790,7 +791,7 @@ impl ExtensionPlanner for MergeMetricExtensionPlanner {
             let schema = validation.input.schema();
             return Ok(Some(Arc::new(MergeValidationExec::new(
                 physical_inputs.first().unwrap().clone(),
-                planner.create_physical_expr(&validation.expr, schema, session_state)?
+                planner.create_physical_expr(&validation.expr, schema, session_state)?,
             ))));
         }
 
@@ -1004,7 +1005,10 @@ async fn execute(
 
     let match_operations: Vec<MergeOperation> = match_operations
         .into_iter()
-        .map(|op| MergeOperation::try_from(op, &join_schema_df, &state, &target_alias))
+        .map(|op| {
+            MergeOperation::try_from(op, &join_schema_df, &state, &target_alias)
+                .map(MergeOperation::into_matched)
+        })
         .collect::<Result<Vec<MergeOperation>, DeltaTableError>>()?;
 
     let not_match_target_operations: Vec<MergeOperation> = not_match_target_operations
@@ -1084,17 +1088,15 @@ async fn execute(
 
     let mut when_expr = Vec::with_capacity(operations_size);
     let mut then_expr = Vec::with_capacity(operations_size);
-    let mut ops = Vec::with_capacity(operations_size);
-    let mut planned_ops = Vec::with_capacity(operations_size);
+    let mut ops: Vec<(HashMap<Column, Expr>, OperationType, CardinalityClass)> =
+        Vec::with_capacity(operations_size);
 
     fn update_case(
         operations: Vec<MergeOperation>,
-        ops: &mut Vec<(HashMap<Column, Expr>, OperationType)>,
-        planned_ops: &mut Vec<PlannedOp>,
+        ops: &mut Vec<(HashMap<Column, Expr>, OperationType, CardinalityClass)>,
         when_expr: &mut Vec<Expr>,
         then_expr: &mut Vec<Expr>,
         base_expr: &Expr,
-        category: MatchCategory,
     ) -> DeltaResult<Vec<MergePredicate>> {
         let mut predicates = Vec::with_capacity(operations.len());
 
@@ -1107,30 +1109,7 @@ async fn execute(
             when_expr.push(predicate);
             then_expr.push(lit(ops.len() as i32));
 
-            let is_unconditional_delete =
-                matches!(op.r#type, OperationType::Delete) && op.predicate.is_none();
-
-            let cardinality_class = match category {
-                MatchCategory::Matched => match op.r#type {
-                    OperationType::Delete if is_unconditional_delete => {
-                        CardinalityClass::MatchedUnconditionalDelete
-                    }
-                    OperationType::Delete | OperationType::Update | OperationType::Copy => {
-                        CardinalityClass::DuplicateInvalidating
-                    }
-                    OperationType::Insert | OperationType::SourceDelete => CardinalityClass::Ignore,
-                },
-                MatchCategory::NotMatchedTarget | MatchCategory::NotMatchedSource => {
-                    CardinalityClass::Ignore
-                }
-            };
-
-            let planned_op = PlannedOp {
-                cardinality_class,
-            };
-
-            ops.push((op.operations, op.r#type));
-            planned_ops.push(planned_op);
+            ops.push((op.operations, op.r#type, op.cardinality_class));
 
             let action_type = match op.r#type {
                 OperationType::Update => "update",
@@ -1161,53 +1140,50 @@ async fn execute(
     let match_operations = update_case(
         match_operations,
         &mut ops,
-        &mut planned_ops,
         &mut when_expr,
         &mut then_expr,
         &matched,
-        MatchCategory::Matched,
     )?;
 
     let not_match_target_operations = update_case(
         not_match_target_operations,
         &mut ops,
-        &mut planned_ops,
         &mut when_expr,
         &mut then_expr,
         &not_matched_target,
-        MatchCategory::NotMatchedTarget,
     )?;
 
     let not_match_source_operations = update_case(
         not_match_source_operations,
         &mut ops,
-        &mut planned_ops,
         &mut when_expr,
         &mut then_expr,
         &not_matched_source,
-        MatchCategory::NotMatchedSource,
     )?;
 
     when_expr.push(matched);
     then_expr.push(lit(ops.len() as i32));
-    ops.push((HashMap::new(), OperationType::Copy));
-    planned_ops.push(PlannedOp {
-        cardinality_class: CardinalityClass::DuplicateInvalidating,
-    });
+    ops.push((
+        HashMap::new(),
+        OperationType::Copy,
+        CardinalityClass::DuplicateInvalidating,
+    ));
 
     when_expr.push(not_matched_target);
     then_expr.push(lit(ops.len() as i32));
-    ops.push((HashMap::new(), OperationType::SourceDelete));
-    planned_ops.push(PlannedOp {
-        cardinality_class: CardinalityClass::Ignore,
-    });
+    ops.push((
+        HashMap::new(),
+        OperationType::SourceDelete,
+        CardinalityClass::Ignore,
+    ));
 
     when_expr.push(not_matched_source);
     then_expr.push(lit(ops.len() as i32));
-    ops.push((HashMap::new(), OperationType::Copy));
-    planned_ops.push(PlannedOp {
-        cardinality_class: CardinalityClass::Ignore,
-    });
+    ops.push((
+        HashMap::new(),
+        OperationType::Copy,
+        CardinalityClass::Ignore,
+    ));
 
     let case = CaseBuilder::new(None, when_expr, then_expr, None).end()?;
 
@@ -1263,8 +1239,8 @@ async fn execute(
             Column::new(source_qualifier.clone(), name)
         };
 
-        for (idx, (operations, _)) in ops.iter().enumerate() {
-            let op = operations
+        for (idx, (operations, _, _)) in ops.iter().enumerate() {
+            let op: Expr = operations
                 .get(&column)
                 .map(|expr| expr.to_owned())
                 .unwrap_or_else(|| col(column.clone()));
@@ -1322,7 +1298,7 @@ async fn execute(
     let mut copy_when = Vec::with_capacity(ops.len());
     let mut copy_then = Vec::with_capacity(ops.len());
 
-    for (idx, (_operations, r#type)) in ops.iter().enumerate() {
+    for (idx, (_operations, r#type, _)) in ops.iter().enumerate() {
         let op = idx as i32;
 
         // Used to indicate the record should be dropped prior to write
@@ -1416,12 +1392,12 @@ async fn execute(
     };
 
     let new_columns = if !match_operations.is_empty() {
-        let mut cardinality_when = Vec::with_capacity(planned_ops.len());
-        let mut cardinality_then = Vec::with_capacity(planned_ops.len());
+        let mut cardinality_when = Vec::with_capacity(ops.len());
+        let mut cardinality_then = Vec::with_capacity(ops.len());
 
-        for (idx, planned_op) in planned_ops.iter().enumerate() {
+        for (idx, (_, _, cardinality_class)) in ops.iter().enumerate() {
             cardinality_when.push(lit(idx as i32));
-            cardinality_then.push(lit(planned_op.cardinality_class.as_i32()));
+            cardinality_then.push(lit(*cardinality_class as i32));
         }
 
         let cardinality_class = CaseBuilder::new(
@@ -1433,10 +1409,7 @@ async fn execute(
         .end()?;
 
         let new_columns = DataFrame::new(state.clone(), new_columns)
-            .with_column(
-                TARGET_MATCH_CARDINALITY_CLASS_COLUMN,
-                cardinality_class,
-            )?
+            .with_column(TARGET_MATCH_CARDINALITY_CLASS_COLUMN, cardinality_class)?
             .into_unoptimized_plan();
 
         LogicalPlan::Extension(Extension {
