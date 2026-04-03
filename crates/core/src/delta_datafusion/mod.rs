@@ -71,12 +71,14 @@ pub(crate) use data_validation::{
     DataValidationExec, constraints_to_exprs, generated_columns_to_exprs, validation_predicates,
 };
 pub(crate) use find_files::*;
+pub(crate) use table_provider::next::normalize_path_as_file_id;
 pub use table_provider::{
     DeltaScan, DeltaScanConfig, DeltaScanConfigBuilder, DeltaTableProvider, TableProviderBuilder,
     next::DeltaScanExec,
 };
 pub(crate) use table_provider::{
-    DeltaScanBuilder, next::FILE_ID_COLUMN_DEFAULT, update_datafusion_session,
+    DeltaScanBuilder, next::FILE_ID_COLUMN_DEFAULT, resolve_file_column_name,
+    update_datafusion_session,
 };
 
 pub(crate) const PATH_COLUMN: &str = "__delta_rs_path";
@@ -271,16 +273,12 @@ pub(crate) fn files_matching_predicate<'a>(
 
         Ok(Either::Left(log_data.into_iter().zip(mask).filter_map(
             |(file, keep_file)| {
-                if keep_file {
-                    Some(file.add_action())
-                } else {
-                    None
-                }
+                if keep_file { Some(file.to_add()) } else { None }
             },
         )))
     } else {
         Ok(Either::Right(
-            log_data.into_iter().map(|file| file.add_action()),
+            log_data.into_iter().map(|file| file.to_add()),
         ))
     }
 }

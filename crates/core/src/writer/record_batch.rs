@@ -31,10 +31,11 @@ use super::utils::{
 use super::{DeltaWriter, DeltaWriterError, WriteMode};
 use crate::DeltaTable;
 use crate::errors::DeltaTableError;
-use crate::kernel::MetadataExt as _;
+use crate::kernel::schema::cast::normalize_for_delta;
 use crate::kernel::schema::merge_arrow_schema;
 use crate::kernel::transaction::CommitProperties;
 use crate::kernel::{Action, Add, PartitionsExt, scalars::ScalarExt};
+use crate::kernel::{MetadataExt as _, Version};
 use crate::logstore::ObjectStoreRetryExt;
 use crate::table::builder::DeltaTableBuilder;
 use crate::table::config::DEFAULT_NUM_INDEX_COLS;
@@ -83,6 +84,8 @@ impl RecordBatchWriter {
             |_| HashMap::new(),
             |snapshot| snapshot.metadata().configuration().clone(),
         );
+
+        let schema = normalize_for_delta(&schema);
 
         Ok(Self {
             storage: delta_table.object_store(),
@@ -262,6 +265,17 @@ impl DeltaWriter<RecordBatch> for RecordBatchWriter {
         // on its flush_and_commit
         self.should_evolve = mode == WriteMode::MergeSchema;
 
+        let values = if values.schema() != self.arrow_schema_ref {
+            let normalized = normalize_for_delta(&values.schema());
+            if normalized != values.schema() {
+                crate::kernel::schema::cast::cast_record_batch(&values, normalized, true, false)?
+            } else {
+                values
+            }
+        } else {
+            values
+        };
+
         for result in self.divide_by_partition_values(&values)? {
             let maybe_evolved_schema = self
                 .write_partition(result.record_batch, &result.partition_values, mode)
@@ -301,7 +315,10 @@ impl DeltaWriter<RecordBatch> for RecordBatchWriter {
 
     /// Flush the internal write buffers to files in the delta table folder structure.
     /// and commit the changes to the Delta log, creating a new table version.
-    async fn flush_and_commit(&mut self, table: &mut DeltaTable) -> Result<i64, DeltaTableError> {
+    async fn flush_and_commit(
+        &mut self,
+        table: &mut DeltaTable,
+    ) -> Result<Version, DeltaTableError> {
         use crate::kernel::StructType;
         let mut adds: Vec<Action> = self.flush().await?.drain(..).map(Action::Add).collect();
 

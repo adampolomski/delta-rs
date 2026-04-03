@@ -7,6 +7,7 @@ use url::Url;
 
 use chrono::{TimeZone, Utc};
 use delta_kernel::FileMeta;
+use delta_kernel::last_checkpoint_hint::LastCheckpointHint;
 use delta_kernel::snapshot::Snapshot;
 use futures::{StreamExt, TryStreamExt};
 use object_store::ObjectStore;
@@ -17,7 +18,7 @@ use regex::Regex;
 use tracing::{debug, error};
 use uuid::Uuid;
 
-use crate::kernel::spawn_blocking_with_span;
+use crate::kernel::{Version, spawn_blocking_with_span};
 use crate::logstore::{DELTA_LOG_REGEX, LogStore};
 use crate::protocol::to_rb;
 use crate::table::config::TablePropertiesExt as _;
@@ -30,7 +31,7 @@ static CHECKPOINT_REGEX: LazyLock<Regex> =
 /// Creates checkpoint for a given table version, table state and object store
 #[tracing::instrument(skip(log_store), fields(operation = "checkpoint", version = version, table_uri = %log_store.root_url()))]
 pub(crate) async fn create_checkpoint_for(
-    version: u64,
+    version: Version,
     log_store: &dyn LogStore,
     operation_id: Option<Uuid>,
 ) -> DeltaResult<()> {
@@ -127,12 +128,7 @@ pub(crate) async fn create_checkpoint_for(
 /// Creates checkpoint at current table version
 pub async fn create_checkpoint(table: &DeltaTable, operation_id: Option<Uuid>) -> DeltaResult<()> {
     let snapshot = table.snapshot()?;
-    create_checkpoint_for(
-        snapshot.version() as u64,
-        table.log_store.as_ref(),
-        operation_id,
-    )
-    .await?;
+    create_checkpoint_for(snapshot.version(), table.log_store.as_ref(), operation_id).await?;
     Ok(())
 }
 
@@ -159,18 +155,18 @@ pub async fn cleanup_metadata(
 /// If it's empty then the table's `enableExpiredLogCleanup` is used.
 pub async fn create_checkpoint_from_table_url_and_cleanup(
     table_url: Url,
-    version: i64,
+    version: Version,
     cleanup: Option<bool>,
     operation_id: Option<Uuid>,
 ) -> DeltaResult<()> {
     let table = open_table_with_version(table_url, version).await?;
     let snapshot = table.snapshot()?;
-    create_checkpoint_for(version as u64, table.log_store.as_ref(), operation_id).await?;
+    create_checkpoint_for(version, table.log_store.as_ref(), operation_id).await?;
 
     let enable_expired_log_cleanup =
         cleanup.unwrap_or_else(|| snapshot.table_config().enable_expired_log_cleanup());
 
-    if snapshot.version() >= 0 && enable_expired_log_cleanup {
+    if snapshot.version() > 0 && enable_expired_log_cleanup {
         let deleted_log_num = cleanup_metadata(&table, operation_id).await?;
         debug!("Deleted {deleted_log_num:?} log files.");
     }
@@ -197,7 +193,7 @@ pub async fn create_checkpoint_from_table_url_and_cleanup(
 /// See also: https://github.com/delta-io/delta-rs/issues/3692 for background on
 /// why cleanup must align to an existing checkpoint.
 pub async fn cleanup_expired_logs_for(
-    mut keep_version: i64,
+    mut keep_version: Version,
     log_store: &dyn LogStore,
     cutoff_timestamp: i64,
     operation_id: Option<Uuid>,
@@ -225,7 +221,7 @@ pub async fn cleanup_expired_logs_for(
             DELTA_LOG_REGEX
                 .captures(path)
                 .and_then(|caps| caps.get(1))
-                .and_then(|v| v.as_str().parse::<i64>().ok())
+                .and_then(|v| v.as_str().parse::<Version>().ok())
                 .map(|ver| (ver, m.last_modified.timestamp_millis()))
         })
         .filter(|(_, ts)| *ts >= cutoff_timestamp)
@@ -247,7 +243,7 @@ pub async fn cleanup_expired_logs_for(
             CHECKPOINT_REGEX
                 .captures(path)
                 .and_then(|caps| caps.get(1))
-                .and_then(|v| v.as_str().parse::<i64>().ok())
+                .and_then(|v| v.as_str().parse::<Version>().ok())
         })
         .filter(|ver| *ver <= keep_version)
         .max();
@@ -277,7 +273,7 @@ pub async fn cleanup_expired_logs_for(
             let captures = DELTA_LOG_REGEX.captures(path_str)?;
             let ts = meta.last_modified.timestamp_millis();
             let log_ver_str = captures.get(1).unwrap().as_str();
-            let Ok(log_ver) = log_ver_str.parse::<i64>() else {
+            let Ok(log_ver) = log_ver_str.parse::<Version>() else {
                 return None;
             };
             if log_ver < safe_checkpoint_version && ts <= cutoff_timestamp {
@@ -298,24 +294,31 @@ pub async fn cleanup_expired_logs_for(
     Ok(deleted.len())
 }
 
+/// Parse `_last_checkpoint` JSON bytes into a [`LastCheckpointHint`].
+///
+/// Invalid JSON is logged as a warning and treated as absent so callers can
+/// safely fall back to directory listing. Callers are responsible for their
+/// own I/O and can adapt the parsed result to their needs (e.g., extracting
+/// only the version field).
+pub(crate) fn parse_last_checkpoint_hint(data: &[u8]) -> Option<LastCheckpointHint> {
+    serde_json::from_slice(data)
+        .inspect_err(|e| tracing::warn!("invalid _last_checkpoint JSON: {e}"))
+        .ok()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    use delta_kernel::last_checkpoint_hint::LastCheckpointHint;
-    use object_store::Error;
+    use object_store::Error as ObjectStoreError;
     use object_store::path::Path;
-    use tracing::warn;
 
-    use crate::DeltaResult;
     use crate::writer::test_utils::get_delta_schema;
 
     /// Try reading the `_last_checkpoint` file.
     ///
-    /// Note that we typically want to ignore a missing/invalid `_last_checkpoint` file without failing
-    /// the read. Thus, the semantics of this function are to return `None` if the file is not found or
-    /// is invalid JSON. Unexpected/unrecoverable errors are returned as `Err` case and are assumed to
-    /// cause failure.
+    /// Missing or invalid hints are treated as absent so callers can safely fall
+    /// back to directory listing.
     async fn read_last_checkpoint(
         storage: &dyn ObjectStore,
         log_path: &Path,
@@ -325,12 +328,42 @@ mod tests {
         let maybe_data = storage.get(&file_path).await;
         let data = match maybe_data {
             Ok(data) => data.bytes().await?,
-            Err(Error::NotFound { .. }) => return Ok(None),
+            Err(ObjectStoreError::NotFound { .. }) => return Ok(None),
             Err(err) => return Err(err.into()),
         };
-        Ok(serde_json::from_slice(&data)
-            .inspect_err(|e| warn!("invalid _last_checkpoint JSON: {e}"))
-            .ok())
+        Ok(parse_last_checkpoint_hint(&data))
+    }
+
+    #[test]
+    fn test_parse_last_checkpoint_hint_valid() {
+        let json = br#"{"version": 42, "size": 100}"#;
+        let hint = parse_last_checkpoint_hint(json).expect("should parse valid JSON");
+        assert_eq!(hint.version, 42);
+    }
+
+    #[test]
+    fn test_parse_last_checkpoint_hint_invalid_json() {
+        let data = b"not valid json";
+        assert!(parse_last_checkpoint_hint(data).is_none());
+    }
+
+    #[test]
+    fn test_parse_last_checkpoint_hint_empty() {
+        assert!(parse_last_checkpoint_hint(b"").is_none());
+    }
+
+    #[test]
+    fn test_parse_last_checkpoint_hint_missing_required_fields() {
+        // version and size are required by LastCheckpointHint
+        let json = br#"{"version": 1}"#;
+        assert!(parse_last_checkpoint_hint(json).is_none());
+    }
+
+    #[test]
+    fn test_parse_last_checkpoint_hint_extra_fields_ignored() {
+        let json = br#"{"version": 5, "size": 10, "unknownField": true}"#;
+        let hint = parse_last_checkpoint_hint(json).expect("extra fields should be ignored");
+        assert_eq!(hint.version, 5);
     }
 
     #[tokio::test]

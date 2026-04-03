@@ -77,6 +77,7 @@ use crate::operations::CustomExecuteHandler;
 use crate::operations::cdc::CDC_COLUMN_NAME;
 use crate::operations::write::execution::write_exec_plan;
 use crate::protocol::DeltaOperation;
+use crate::table::config::TablePropertiesExt as _;
 use crate::table::state::DeltaTableState;
 
 const SOURCE_COUNT_ID: &str = "delete_source_count";
@@ -244,7 +245,7 @@ impl std::future::IntoFuture for DeleteBuilder {
                 .transpose()?;
 
             let operation = DeltaOperation::Delete {
-                predicate: predicate.as_ref().map(|p| fmt_expr_to_sql(p)).transpose()?,
+                predicate: predicate.as_ref().map(fmt_expr_to_sql).transpose()?,
             };
 
             let (actions, metrics) = execute(
@@ -346,9 +347,11 @@ async fn execute(
     operation_id: Uuid,
 ) -> DeltaResult<(Vec<Action>, DeleteMetrics)> {
     let exec_start = Instant::now();
-    let mut metrics = DeleteMetrics::default();
-    metrics.num_removed_files = 0;
-    metrics.num_added_files = 0;
+    let mut metrics = DeleteMetrics {
+        num_removed_files: 0,
+        num_added_files: 0,
+        ..Default::default()
+    };
 
     let scan_start = Instant::now();
 
@@ -504,12 +507,14 @@ async fn execute(
     };
 
     let exec = session.create_physical_plan(&write_plan).await?;
+    let target_file_size = Some(snapshot.table_properties().target_file_size());
     let (mut actions, _) = write_exec_plan(
         session,
         log_store.as_ref(),
         snapshot.table_configuration(),
         exec.clone(),
         Some(operation_id),
+        target_file_size,
         write_cdc,
     )
     .await?;
