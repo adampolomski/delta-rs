@@ -43,14 +43,13 @@ use datafusion::common::{
 use datafusion::datasource::provider_as_source;
 use datafusion::error::Result as DataFusionResult;
 use datafusion::execution::session_state::SessionStateBuilder;
-use datafusion::functions_aggregate::count::count_all_window;
 use datafusion::functions_window::expr_fn::row_number;
 use datafusion::logical_expr::build_join_schema;
 use datafusion::logical_expr::execution_props::ExecutionProps;
 use datafusion::logical_expr::simplify::SimplifyContext;
 use datafusion::logical_expr::utils::split_conjunction_owned;
 use datafusion::logical_expr::{
-    Expr, ExprFunctionExt, JoinType, col, conditional_expressions::CaseBuilder, lit, when,
+    Expr, JoinType, col, conditional_expressions::CaseBuilder, lit, when,
 };
 use datafusion::logical_expr::{
     Extension, LogicalPlan, LogicalPlanBuilder, UNNAMED_TABLE, UserDefinedLogicalNode,
@@ -120,7 +119,6 @@ pub(crate) const TARGET_COPY_COLUMN: &str = "__delta_rs_target_copy";
 
 // Duplicate match validation markers
 const TARGET_MATCH_CARDINALITY_CLASS_COLUMN: &str = "__delta_rs_match_cardinality_class";
-pub(crate) const TARGET_DUPLICATE_MATCH_VIOLATION_COLUMN: &str = "__delta_rs_duplicate_match_violation";
 
 const SOURCE_COUNT_METRIC: &str = "num_source_rows";
 const TARGET_COUNT_METRIC: &str = "num_target_rows";
@@ -1434,24 +1432,10 @@ async fn execute(
         )
         .end()?;
 
-        let candidate_count = count_all_window()
-            .partition_by(vec![col(TARGET_ROW_INDEX_COLUMN)])
-            .filter(col(TARGET_MATCH_CARDINALITY_CLASS_COLUMN).not_eq(lit(0)))
-            .build()?;
-
-        let invalidating_count = count_all_window()
-            .partition_by(vec![col(TARGET_ROW_INDEX_COLUMN)])
-            .filter(col(TARGET_MATCH_CARDINALITY_CLASS_COLUMN).eq(lit(2)))
-            .build()?;
-
         let new_columns = DataFrame::new(state.clone(), new_columns)
             .with_column(
                 TARGET_MATCH_CARDINALITY_CLASS_COLUMN,
                 cardinality_class,
-            )?
-            .with_column(
-                TARGET_DUPLICATE_MATCH_VIOLATION_COLUMN,
-                candidate_count.gt(lit(1_i64)).and(invalidating_count.gt(lit(0_i64))),
             )?
             .into_unoptimized_plan();
 

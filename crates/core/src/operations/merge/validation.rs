@@ -1,8 +1,9 @@
+use std::collections::HashMap;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{Context, Poll};
 
-use arrow::array::{Array, BooleanArray, RecordBatch};
+use arrow::array::{Array, UInt64Array, Int32Array, RecordBatch};
 use arrow::datatypes::SchemaRef;
 use datafusion::common::{DataFusionError, Result as DataFusionResult};
 use datafusion::logical_expr::{Expr, LogicalPlan, UserDefinedLogicalNodeCore};
@@ -14,7 +15,7 @@ use datafusion::physical_plan::{
 use futures::{Stream, StreamExt};
 
 use crate::DeltaTableError;
-use crate::operations::merge::TARGET_DUPLICATE_MATCH_VIOLATION_COLUMN;
+use crate::operations::merge::{TARGET_MATCH_CARDINALITY_CLASS_COLUMN, TARGET_ROW_INDEX_COLUMN};
 
 #[derive(Debug)]
 pub(crate) struct MergeValidationExec {
@@ -97,35 +98,84 @@ impl DisplayAs for MergeValidationExec {
 struct MergeValidationStream {
     schema: SchemaRef,
     input: SendableRecordBatchStream,
+    target_row_state: HashMap<u64, (i32, i32)>,
 }
 
 impl MergeValidationStream {
     fn new(input: SendableRecordBatchStream, schema: SchemaRef) -> Self {
-        Self { schema, input }
+        Self {
+            schema,
+            input,
+            target_row_state: HashMap::new(),
+        }
     }
 
-    fn validate_batch(&self, batch: &RecordBatch) -> DataFusionResult<()> {
-        let violation_column = batch
-            .column_by_name(TARGET_DUPLICATE_MATCH_VIOLATION_COLUMN)
-            .ok_or_else(required_operation_column_err)?;
-
-        let violation_array = violation_column
-            .as_any()
-            .downcast_ref::<BooleanArray>()
+    fn validate_batch(&mut self, batch: &RecordBatch) -> DataFusionResult<()> {
+        // Extract target row index column
+        let target_row_index_col = batch
+            .column_by_name(TARGET_ROW_INDEX_COLUMN)
             .ok_or_else(|| {
                 DataFusionError::External(Box::new(DeltaTableError::Generic(
-                    "Merge duplicate match violation column is not Boolean".to_string(),
+                    "Required column __delta_rs_target_row_index is missing".to_string(),
                 )))
             })?;
 
-        // Check if any row has a violation (true value)
+        let target_row_index_array = target_row_index_col
+            .as_any()
+            .downcast_ref::<UInt64Array>()
+            .ok_or_else(|| {
+                DataFusionError::External(Box::new(DeltaTableError::Generic(
+                    "Column __delta_rs_target_row_index is not UInt64".to_string(),
+                )))
+            })?;
+
+        let cardinality_class_col = batch
+            .column_by_name(TARGET_MATCH_CARDINALITY_CLASS_COLUMN)
+            .ok_or_else(|| {
+                DataFusionError::External(Box::new(DeltaTableError::Generic(
+                    "Required column __delta_rs_match_cardinality_class is missing".to_string(),
+                )))
+            })?;
+
+        let cardinality_class_array = cardinality_class_col
+            .as_any()
+            .downcast_ref::<Int32Array>()
+            .ok_or_else(|| {
+                DataFusionError::External(Box::new(DeltaTableError::Generic(
+                    "Column __delta_rs_match_cardinality_class is not Int32".to_string(),
+                )))
+            })?;
+
         for row in 0..batch.num_rows() {
-            if !violation_array.is_null(row) && violation_array.value(row) {
-                return Err(DataFusionError::External(Box::new(
-                    DeltaTableError::Generic(
-                        "Merge matched a single target row with multiple source rows".to_string(),
-                    ),
-                )));
+            if !target_row_index_array.is_null(row) && !cardinality_class_array.is_null(row) {
+                let target_row_index = target_row_index_array.value(row);
+                let cardinality_class = cardinality_class_array.value(row);
+
+                let (candidate_count, invalidating_count) = self
+                    .target_row_state
+                    .entry(target_row_index)
+                    .or_insert((0, 0));
+
+                // Count as candidate if class != 0
+                if cardinality_class != 0 {
+                    *candidate_count += 1;
+                }
+
+                // Count as invalidating if class == 2
+                if cardinality_class == 2 {
+                    *invalidating_count += 1;
+                }
+
+                if *candidate_count > 1 && *invalidating_count > 0 {
+                    return Err(DataFusionError::External(Box::new(
+                        DeltaTableError::Generic(
+                            format!(
+                                "Merge matched a single target row (index: {}) with multiple source rows",
+                                target_row_index
+                            ),
+                        ),
+                    )));
+                }
             }
         }
 
@@ -133,11 +183,6 @@ impl MergeValidationStream {
     }
 }
 
-fn required_operation_column_err() -> DataFusionError {
-    DataFusionError::External(Box::new(DeltaTableError::Generic(
-        "Required operation column is missing".to_string(),
-    )))
-}
 
 impl Stream for MergeValidationStream {
     type Item = DataFusionResult<RecordBatch>;
